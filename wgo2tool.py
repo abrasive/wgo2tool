@@ -152,6 +152,31 @@ class Wgo2TX(object):
         self.dev.write([1, TXCommand.ENABLE_MASS_STORAGE, 0, 0, 0, 0, 0, 0, 0])
         self.reconnect()
 
+        return self.get_mass_storage_device()
+
+    def get_mass_storage_device(self):
+        # find the USB device, which is the 1.1 to the HID's 1.0
+        usb_name = self.usb_path[:-1].decode('ascii') + '1'
+        usb_path = Path('/sys/bus/usb/devices') / usb_name
+
+        start = time.time()
+
+        while True:
+            try:
+                devices = list(usb_path.glob('host*/target*/*:*:*:*/block/*'))
+                if len(devices) == 0:
+                    raise ValueError("no device found")
+
+                blockdev = '/dev/' + devices[0].name
+                if not os.access(blockdev, os.R_OK):
+                    raise ValueError(f"can't open {blockdev} for reading")
+
+                return blockdev
+
+            except ValueError:
+                if time.time() > start + 10:
+                    raise
+                time.sleep(0.2)
 
     def enable_ate_mode(self):
         # Factory test mode. Acts as a USB microphone.
@@ -182,15 +207,11 @@ class Wgo2TX(object):
 
 class DeviceFileBrowser(object):
     def __init__(self, tx: 'Wgo2TX'):
-        # find the USB device, which is the 1.1 to the HID's 1.0
-        usb_name = tx.usb_path[:-1].decode('ascii') + '1'
-        usb_path = Path('/sys/bus/usb/devices') / usb_name
-        devices = list(usb_path.glob('host*/target*/*:*:*:*/block/*'))
-        assert len(devices) == 1
-        device = devices[0].name
+        blockdev = tx.enable_mass_storage()
+
         self.serial = tx.serial
 
-        self.fs = fs.open_fs(f'fat:///dev/{device}?read_only=True')
+        self.fs = fs.open_fs(f'fat://{blockdev}?read_only=True')
 
     def get_ugg_files(self):
         return self.fs.walk.files(filter=['*.UGG'])
@@ -210,14 +231,11 @@ class DeviceFileBrowser(object):
 if __name__ == "__main__":
     dev = Wgo2TX()
 
-    print(time.gmtime(dev.option_read_long(TXOption.CLOCK)))
-    dev.sync_clock()
-    print(time.gmtime(dev.option_read_long(TXOption.CLOCK)))
-
     print("Connected to TX s/n", dev.serial)
     print("Firmware version", dev.firmware_version_str)
-
-    dev.enable_mass_storage()
+    dev.sync_clock()
 
     files = DeviceFileBrowser(dev)
     files.convert_all('out')
+
+    dev.erase_recordings()
