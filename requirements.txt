@@ -1,2 +1,4 @@
 cython-hidapi
 tqdm
+python-dateutil
+pyfatfs

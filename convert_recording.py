@@ -223,15 +223,10 @@ def make_cuesheet(markers):
     fp.flush()
     return fp
 
-def convert_ugg(ugg_filename, out_filename):
+def convert_ugg(ugg, egg, timestamp, out_filename):
     flac = out_filename.lower().endswith('.flac')
     if not flac and not out_filename.lower().endswith('.wav'):
         raise ValueError('Unrecognised file extension - must be .wav or .flac')
-
-    ugg_filename = Path(ugg_filename)
-    egg_name = 'PEA' + ugg_filename.name.removeprefix('REC').removesuffix('UGG') + 'EGG'
-    egg_filename = ugg_filename.parent / egg_name
-
 
     if flac:
         wavefile = tempfile.NamedTemporaryFile(suffix='.wav')
@@ -242,24 +237,21 @@ def convert_ugg(ugg_filename, out_filename):
             'wavefile': wavefile,
             }
 
-    with open(ugg_filename, 'rb') as fp:
-        out = decode(fp, options)
+    decode(ugg, options)
 
-    with open(egg_filename, 'rb') as fp:
-        out = decode(fp)
-        markers = out['markers']
+    out = decode(egg)
+    markers = out['markers']
 
     if len(markers):
         cuesheet = make_cuesheet(markers)
     else:
         cuesheet = None
 
-    recording_timestamp = os.path.getctime(ugg_filename)
     local_timezone = datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo
-    recording_datetime = datetime.datetime.fromtimestamp(recording_timestamp, tz=local_timezone)
+    recording_datetime = datetime.datetime.fromtimestamp(timestamp, tz=local_timezone)
 
     # flac copies the times, so we can set them here
-    os.utime(wavefile.name, (recording_timestamp, recording_timestamp))
+    os.utime(wavefile.name, (timestamp, timestamp))
 
     if flac:
         cmd = [
@@ -275,12 +267,22 @@ def convert_ugg(ugg_filename, out_filename):
 
         subprocess.check_call(cmd)
 
+def eggname_from_uggname(ugg_filename):
+    ugg_filename = Path(ugg_filename)
+    egg_name = 'PEA' + ugg_filename.name.removeprefix('REC').removesuffix('UGG') + 'EGG'
+    return str(ugg_filename.parent / egg_name)
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 3:
         print(f"usage: {sys.argv[0]} infile.UGG [outfile.flac|outfile.wav]")
         sys.exit(1)
 
-    infile = sys.argv[1]
+    uggfile = sys.argv[1]
     outfile = sys.argv[2]
-    convert_ugg(infile, outfile)
+
+    eggfile = eggname_from_uggname(uggfile)
+
+    timestamp = os.path.getctime(uggfile)
+
+    convert_ugg(open(uggfile, 'rb'), open(eggfile, 'rb'), timestamp, outfile)

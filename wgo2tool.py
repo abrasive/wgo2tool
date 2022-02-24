@@ -1,10 +1,16 @@
+#!/usr/bin/env python3
+
 from typing import Optional
-import hid
+import hid  # cython-hidapi, specifically
 import struct
 import enum
 import time
 import calendar
 import atexit
+from pathlib import Path
+import fs
+from dateutil import tz
+from convert_recording import *
 
 class TXOption(enum.IntEnum):
     BATTERY_PERCENT         = 0x00
@@ -51,6 +57,7 @@ class Wgo2TX(object):
                 try:
                     # in ATE mode, the device doesn't expose its s/n via the USB descriptor string, so we have to manually search for it.
                     self.dev.open_path(device['path'])
+                    self.dev.read(128, timeout_ms=10)
                     serial_bytes = self.command1(TXCommand.GET_SERIAL)[:4]
                     serial_str = ''.join('%02X' % x for x in serial_bytes)
 
@@ -58,6 +65,7 @@ class Wgo2TX(object):
                         continue
 
                     self.serial = serial_str
+                    self.usb_path = device['path']
                     return
 
                 except OSError:
@@ -141,7 +149,9 @@ class Wgo2TX(object):
 
 
     def enable_mass_storage(self):
-        self.command1(0x51)
+        self.dev.write([1, TXCommand.ENABLE_MASS_STORAGE, 0, 0, 0, 0, 0, 0, 0])
+        self.reconnect()
+
 
     def enable_ate_mode(self):
         # Factory test mode. Acts as a USB microphone.
@@ -170,6 +180,33 @@ class Wgo2TX(object):
     def firmware_version_str(self):
         return '.'.join(map(str, self.firmware_version))
 
+class DeviceFileBrowser(object):
+    def __init__(self, tx: 'Wgo2TX'):
+        # find the USB device, which is the 1.1 to the HID's 1.0
+        usb_name = tx.usb_path[:-1].decode('ascii') + '1'
+        usb_path = Path('/sys/bus/usb/devices') / usb_name
+        devices = list(usb_path.glob('host*/target*/*:*:*:*/block/*'))
+        assert len(devices) == 1
+        device = devices[0].name
+        self.serial = tx.serial
+
+        self.fs = fs.open_fs(f'fat:///dev/{device}?read_only=True')
+
+    def get_ugg_files(self):
+        return self.fs.walk.files(filter=['*.UGG'])
+
+    def convert_all(self, dest_dir):
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(exist_ok=True)
+        for file in self.get_ugg_files():
+            file_time = self.fs.getmodified(file).astimezone(tz.tzlocal())
+
+            outname = dest_dir / (file_time.strftime('%Y%m%d_%H%M%S_') + self.serial + '.flac')
+
+            eggname = eggname_from_uggname(file)
+            with self.fs.open(file, 'rb') as ugg, self.fs.open(eggname, 'rb') as egg:
+                convert_ugg(ugg, egg, file_time.timestamp(), str(outname))
+
 if __name__ == "__main__":
     dev = Wgo2TX()
 
@@ -180,12 +217,7 @@ if __name__ == "__main__":
     print("Connected to TX s/n", dev.serial)
     print("Firmware version", dev.firmware_version_str)
 
-    dev.enable_ate_mode()
+    dev.enable_mass_storage()
 
-    print("In ATE mode")
-    time.sleep(5)
-
-
-    dev.reboot()
-
-    print("Done")
+    files = DeviceFileBrowser(dev)
+    files.convert_all('out')
