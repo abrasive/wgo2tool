@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from dataclasses import dataclass
 import struct
 import wave
@@ -6,6 +8,7 @@ import datetime
 from pathlib import Path
 import os.path
 import subprocess
+import tqdm
 
 @dataclass
 class Page:
@@ -16,32 +19,67 @@ class Page:
     begin_of_stream: bool
     end_of_stream: bool
 
+class EndOfFileError(Exception):
+    pass
+
+class BufferedStream(object):
+    def __init__(self, stream):
+        self.stream = stream
+        self.buffer = b''
+
+        start = stream.tell()
+        finish = stream.seek(0, 2)
+        stream.seek(start, 0)
+        stream_length = finish - start
+        self.progress = tqdm.tqdm(total=stream_length, unit='byte', unit_scale=True)
+
+
+    def take(self, count):
+        while len(self.buffer) < count:
+            self.read()
+
+        result = self.buffer[:count]
+        self.buffer = self.buffer[count:]
+        return result
+
+    def read(self):
+        data = self.stream.read(8192)
+        if not len(data):
+            self.progress.close()
+            raise EndOfFileError()
+
+        self.progress.update(len(data))
+
+        self.buffer += data
 
 def page_reader(stream):
-    buffer = bytearray()
+    bs = BufferedStream(stream)
 
-    while len(new := stream.read(8192)) or (len(buffer) and b'OggS' in buffer):
-        buffer += new
+    def synchronise():
+        try:
+            sync = bs.take(4)
 
-        sync_pos = buffer.find(b'OggS')
-        if sync_pos < 0:
-            continue
+            while not sync.endswith(b'OggS'):
+                sync += bs.take(1)
 
-        buffer = buffer[sync_pos:]
-        if len(buffer) < 27:
-            continue
+        except EndOfFileError:
+            return False
 
-        if buffer[4] != 0:
-            raise ValueError(f'Unknown stream structure revision 0x{buffer[4]:x}')
+        return True
 
-        stream_serial, = struct.unpack('<L', buffer[14:18])
-        flags = buffer[5]
 
-        num_segments = buffer[26]
-        if len(buffer) < 27 + num_segments:
-            continue
+    while synchronise():
+        page_header = bs.take(23)
 
-        raw_segment_lengths = buffer[27:27+num_segments]
+        if page_header[0] != 0:
+            raise ValueError(f'Unknown stream structure revision 0x{page_header[0]:x}')
+
+        stream_serial, = struct.unpack('<L', page_header[10:14])
+        flags = page_header[1]
+
+        num_segments = page_header[22]
+
+        raw_segment_lengths = bs.take(num_segments)
         segment_lengths = []
         cur_length = 0
         for rsl in raw_segment_lengths:
@@ -51,16 +89,9 @@ def page_reader(stream):
                 segment_lengths.append(rsl + cur_length)
                 cur_length = 0
 
-        payload_length = sum(segment_lengths)
-        if len(buffer) < 27 + num_segments + payload_length:
-            continue
-
-        buffer = buffer[27 + num_segments:]
-
         segments = []
         for segment_length in segment_lengths:
-            segments.append(buffer[:segment_length])
-            buffer = buffer[segment_length:]
+            segments.append(bs.take(segment_length))
 
         yield Page(
                 stream_serial = stream_serial,
@@ -72,11 +103,11 @@ def page_reader(stream):
 
 class CodecHandler(object):
     @classmethod
-    def for_codec(cls, codec_id: bytes, output: dict):
+    def for_codec(cls, codec_id: bytes, output: dict, options: dict):
         if codec_id == b'PCM     ':
-            return OggPCMHandler(output)
+            return OggPCMHandler(output, options)
         elif codec_id == b'RODEWgo2':
-            return W2GoHandler(output)
+            return W2GoHandler(output, options)
         else:
             raise ValueError(f"Unknown codec {codec_id}")
 
@@ -84,10 +115,11 @@ class CodecHandler(object):
         pass
 
 class OggPCMHandler(CodecHandler):
-    def __init__(self, output):
+    def __init__(self, output, options):
         self.output = output
         self.num_extra_header_packets = 0
         self.done_packets = 0
+        self.wavefile = options['wavefile']
 
     def handle_packet(self, packet):
         if self.done_packets == 0:
@@ -107,8 +139,7 @@ class OggPCMHandler(CodecHandler):
         assert minor == 0
         assert pcm_format == 4  # 24-bit
 
-        wavefile = tempfile.NamedTemporaryFile(suffix='.wav')
-        self.wav = wave.open(wavefile, 'w')
+        self.wav = wave.open(self.wavefile, 'w')
 
 
         self.num_extra_header_packets = num_extra_header_packets
@@ -117,11 +148,8 @@ class OggPCMHandler(CodecHandler):
         self.wav.setsampwidth(3)
         self.wav.setframerate(sampling_rate)
 
-        self.output['wave'] = wavefile
-
-
 class W2GoHandler(CodecHandler):
-    def __init__(self, output):
+    def __init__(self, output, options):
         self.output = output
         self.done_packets = 0
         self.buffer = bytearray()
@@ -156,7 +184,7 @@ class W2GoHandler(CodecHandler):
 
             self.seconds += 1
 
-def decode(fp):
+def decode(fp, options={}):
     handlers = {}
     output = {}
 
@@ -167,7 +195,7 @@ def decode(fp):
 
         if page.begin_of_stream:
             codec = bytes(page.segments[0][:8])
-            handlers[page.stream_serial] = CodecHandler.for_codec(codec, output)
+            handlers[page.stream_serial] = CodecHandler.for_codec(codec, output, options)
 
         handler = handlers[page.stream_serial]
 
@@ -195,14 +223,27 @@ def make_cuesheet(markers):
     fp.flush()
     return fp
 
-def convert_ugg(ugg_filename):
+def convert_ugg(ugg_filename, out_filename):
+    flac = out_filename.lower().endswith('.flac')
+    if not flac and not out_filename.lower().endswith('.wav'):
+        raise ValueError('Unrecognised file extension - must be .wav or .flac')
+
     ugg_filename = Path(ugg_filename)
     egg_name = 'PEA' + ugg_filename.name.removeprefix('REC').removesuffix('UGG') + 'EGG'
     egg_filename = ugg_filename.parent / egg_name
 
+
+    if flac:
+        wavefile = tempfile.NamedTemporaryFile(suffix='.wav')
+    else:
+        wavefile = open(out_filename, 'wb')
+
+    options = {
+            'wavefile': wavefile,
+            }
+
     with open(ugg_filename, 'rb') as fp:
-        out = decode(fp)
-        wavefile = out['wave']
+        out = decode(fp, options)
 
     with open(egg_filename, 'rb') as fp:
         out = decode(fp)
@@ -220,18 +261,26 @@ def convert_ugg(ugg_filename):
     # flac copies the times, so we can set them here
     os.utime(wavefile.name, (recording_timestamp, recording_timestamp))
 
-    cmd = [
-        'flac',
-        wavefile.name,
-        '-o', 'test.flac',
-        '-T', 'DATE=' + recording_datetime.isoformat(),
-        '--silent',
-        ]
+    if flac:
+        cmd = [
+            'flac',
+            wavefile.name,
+            '-o', out_filename,
+            '-T', 'DATE=' + recording_datetime.isoformat(),
+            '--silent',
+            ]
 
-    if cuesheet:
-        cmd.extend(['--cuesheet', cuesheet.name])
+        if cuesheet:
+            cmd.extend(['--cuesheet', cuesheet.name])
 
-    subprocess.check_call(cmd)
+        subprocess.check_call(cmd)
 
 if __name__ == "__main__":
-    convert_ugg('example/REC00005.UGG')
+    import sys
+    if len(sys.argv) != 3:
+        print(f"usage: {sys.argv[0]} infile.UGG [outfile.flac|outfile.wav]")
+        sys.exit(1)
+
+    infile = sys.argv[1]
+    outfile = sys.argv[2]
+    convert_ugg(infile, outfile)
