@@ -173,9 +173,9 @@ class Wgo2TX(object):
 if __name__ == "__main__":
     dev = Wgo2TX()
 
-    print(time.localtime(dev.option_read_long(TXOption.CLOCK)))
+    print(time.gmtime(dev.option_read_long(TXOption.CLOCK)))
     dev.sync_clock()
-    print(time.localtime(dev.option_read_long(TXOption.CLOCK)))
+    print(time.gmtime(dev.option_read_long(TXOption.CLOCK)))
 
     print("Connected to TX s/n", dev.serial)
     print("Firmware version", dev.firmware_version_str)
