@@ -4,7 +4,7 @@ import struct
 import enum
 import time
 import calendar
-import itertools
+import atexit
 
 class TXOption(enum.IntEnum):
     BATTERY_PERCENT         = 0x00
@@ -33,6 +33,7 @@ class Wgo2TX(object):
     def __init__(self, serial: Optional[str] = None):
         self.serial = serial
         self.dev = hid.device()
+        atexit.register(self.dev.close)
         self.reconnect(retry=False)
 
     def find_devices(self):
