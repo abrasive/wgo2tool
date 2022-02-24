@@ -1,0 +1,1 @@
+ATTRS{idVendor}=="19f7", MODE="660", GROUP="plugdev", TAG+="uaccess"
